@@ -11,6 +11,7 @@
     "express": "^4.19.2",
     "express-session": "^1.18.0",
     "jsonwebtoken": "^9.0.2",
+    "node-fetch": "^3.3.2",
     "passport": "^0.6.0",
     "passport-azure-ad": "^4.3.5"
   }

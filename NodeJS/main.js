@@ -20,22 +20,18 @@ app.use(session({
   cookie: { secure: process.env.NODE_ENV === 'production' }
 }));
 
-// Middleware to log all requests
-app.use((req, res, next) => {
-  console.log(`${new Date().toISOString()} - ${req.method} ${req.url}`);
-  next();
-});
-
 // Configure passport middleware
 app.use(passport.initialize());
 app.use(passport.session());
 
 // Passport serialization
 passport.serializeUser((user, done) => {
-  done(null, { oid: user.oid, email: user.email });
+  console.log('Serializing user:', user);
+  done(null, user);
 });
 
 passport.deserializeUser((user, done) => {
+  console.log('Deserializing user:', user);
   done(null, user);
 });
 
@@ -50,50 +46,64 @@ function prettyPrintJwt(token) {
   }
 }
 
+// Function to extract email from token payload
+function extractEmailFromToken(token) {
+  try {
+    const decoded = jwt.decode(token);
+    console.log('Decoded token:', JSON.stringify(decoded, null, 2));
+    if (decoded.unique_name && decoded.unique_name.includes('@')) {
+      return decoded.unique_name;
+    }
+    if (decoded.upn && decoded.upn.includes('@')) {
+      return decoded.upn;
+    }
+    console.log('No email found in token');
+    return null;
+  } catch (error) {
+    console.error('Error decoding token:', error);
+    return null;
+  }
+}
+
 // Configure OIDC strategy
 passport.use(new OIDCStrategy({
   identityMetadata: `https://cloudstruccentradev.ciamlogin.com/${process.env.TENANT_ID}/v2.0/.well-known/openid-configuration`,
   clientID: process.env.CLIENT_ID,
-  responseType: 'id_token',
-  responseMode: 'form_post',
+  responseType: 'code',
+  responseMode: 'query',
   redirectUrl: process.env.REDIRECT_URI,
   allowHttpForRedirectUrl: true,
   clientSecret: process.env.CLIENT_SECRET,
   validateIssuer: false,
   passReqToCallback: true,
-  scope: ['openid', 'profile', 'email'],
-  loggingLevel: 'info',
-  loggingNoPII: false
-}, (req, iss, sub, profile, accessToken, refreshToken, params, done) => {
+  scope: ['openid', 'profile', 'email', 'offline_access']
+}, async (req, iss, sub, profile, accessToken, refreshToken, params, done) => {
   console.log('OIDC Strategy Callback:');
   console.log('Issuer:', iss);
   console.log('Subject:', sub);
   console.log('Profile:', JSON.stringify(profile, null, 2));
-  console.log('Access Token:', accessToken ? prettyPrintJwt(accessToken) : 'Not present');
-  
-  // Extract id_token from profile._raw if params is null
-  let idToken = params && params.id_token ? params.id_token : null;
-  if (!idToken && profile._raw) {
-    try {
-      const rawProfile = JSON.parse(profile._raw);
-      idToken = rawProfile.id_token;
-    } catch (error) {
-      console.error('Error parsing profile._raw:', error);
-    }
-  }
-  
-  console.log('ID Token:', idToken ? prettyPrintJwt(idToken) : 'Not present');
+  console.log('Access Token:', accessToken ? 'Present' : 'Not present');
   console.log('Refresh Token:', refreshToken ? 'Present' : 'Not present');
-  
+  console.log('Params:', JSON.stringify(params, null, 2));
+
   if (!profile.oid) {
+    console.error('No OID found in profile');
     return done(new Error("No OID found"), null);
   }
-  
-  // Save the id_token and email to the profile for later use
-  profile.id_token = idToken;
-  profile.email = profile._json.email || profile._json.preferred_username;
-  
-  return done(null, profile);
+
+  const email = extractEmailFromToken(accessToken);
+
+  const user = {
+    oid: profile.oid,
+    email: email,
+    displayName: profile.displayName || profile.name || 'Unknown',
+    accessToken: accessToken,
+    refreshToken: refreshToken
+  };
+
+  console.log('User object created:', user);
+
+  return done(null, user);
 }));
 
 // Define routes
@@ -109,9 +119,9 @@ app.get('/login', (req, res, next) => {
   })(req, res, next);
 });
 
-app.post('/auth/openid/return', (req, res, next) => {
+app.get('/auth/openid/return', (req, res, next) => {
   console.log('Auth return route accessed');
-  console.log('Request body:', req.body);
+  console.log('Query params:', req.query);
   passport.authenticate('azuread-openidconnect', {
     failureRedirect: '/',
     failureFlash: true
@@ -137,36 +147,43 @@ app.post('/auth/openid/return', (req, res, next) => {
   });
 });
 
-app.get('/profile', (req, res) => {
+app.get('/profile', async (req, res) => {
+  console.log('Profile route accessed. User:', req.user);
   if (!req.isAuthenticated()) {
     return res.status(401).send('Unauthorized: No user logged in');
   }
-  
+
   res.json({
     message: `Welcome, ${req.user.displayName || req.user.email || 'User'}!`,
     profile: {
       oid: req.user.oid,
-      email: req.user.email,
+      email: req.user.email || 'Email not available',
       displayName: req.user.displayName || 'N/A'
     }
   });
 });
 
-// Debug route to display the raw token
+// Debug route to display the access token
 app.get('/debug/token', (req, res) => {
-  if (!req.isAuthenticated() || !req.user.id_token) {
-    return res.status(401).send('No token available');
+  console.log('Debug token route accessed. User:', req.user);
+  if (!req.isAuthenticated()) {
+    return res.status(401).send('Unauthorized: No user logged in');
   }
-  res.send(`<pre>${prettyPrintJwt(req.user.id_token)}</pre>`);
+  if (!req.user.accessToken) {
+    return res.status(400).send('No access token available in user object');
+  }
+  res.send(`<pre>${prettyPrintJwt(req.user.accessToken)}</pre>`);
 });
 
 // Route to check current authentication status
 app.get('/status', (req, res) => {
+  console.log('Status route accessed. Is authenticated:', req.isAuthenticated());
+  console.log('User:', req.user);
   res.json({
     authenticated: req.isAuthenticated(),
     user: req.isAuthenticated() ? {
       oid: req.user.oid,
-      email: req.user.email,
+      email: req.user.email || 'Email not available',
       displayName: req.user.displayName || 'N/A'
     } : null
   });
